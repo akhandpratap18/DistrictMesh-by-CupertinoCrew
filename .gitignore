@@ -1,0 +1,66 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+
+*.pbxuser
+!default.pbxuser
+
+*.mode1v3
+!default.mode1v3
+
+*.mode2v3
+!default.mode2v3
+
+*.perspectivev3
+!default.perspectivev3
+
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.hmap
+
+# Archives
+*.ipa
+*.xcarchive
+
+# Swift Package Manager
+.build/
+
+# CocoaPods (only if used)
+Pods/
+!Podfile
+!Podfile.lock
+
+# Fastlane (if you add it later)
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# Firebase (if added later)
+GoogleService-Info.plist
+
+# Environment / Secrets
+.env
+.env.*
+!.env.example
+
+# Supabase local CLI
+.supabase/
+**/.temp/
+
+# Logs
+*.log
+
+# Supabase secrets (never commit these)
+supabase/.env
+
+# Backup / Old directories
+**/Maintenance_Backup_OLD/
+
+# Xcode Configurations
+*.xcconfig
