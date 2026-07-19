@@ -2,29 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleIdentifier</key>
-	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundleDisplayName</key>
 	<string>CupertinoCrew</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>District uses Bluetooth to discover and connect to nearby District devices over an offline mesh, even with no internet connection.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_district-mesh._tcp</string>
 		<string>_district-mesh._udp</string>
 	</array>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>District uses Bluetooth to discover and connect to nearby District devices over an offline mesh, even with no internet connection.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>District uses your local network to find and connect to nearby District devices over an offline mesh, even with no internet connection.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>District uses your location to point you toward friends in your group over the offline mesh.</string>
 	<key>NSNearbyInteractionUsageDescription</key>
 	<string>District uses Nearby Interaction to show live distance and direction to a friend you're finding.</string>
 	<key>UIApplicationSceneManifest_Generation</key>
