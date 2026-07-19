@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 /// Full-screen heading-relative direction arrow toward one tracked group member, plus an
 /// approximate distance. No map, no route — direction only. Refreshes on a timer so the arrow
