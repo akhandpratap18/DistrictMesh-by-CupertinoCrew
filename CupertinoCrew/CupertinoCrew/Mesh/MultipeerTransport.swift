@@ -15,17 +15,23 @@ final class MultipeerTransport: NSObject, MeshTransport {
 	let localPeerID: String
 
 	private let myPeerID: MCPeerID
-	private let session: MCSession
-	private let advertiser: MCNearbyServiceAdvertiser
-	private let browser: MCNearbyServiceBrowser
+	// Rebuilt from scratch on every start()/restart — an MCSession is not reliably reusable after
+	// disconnect(), so reusing the same instance across a Wi-Fi/Bluetooth toggle produces silent
+	// connect failures (advertising/browsing look alive, invites send, but state never reaches
+	// .connected). `var`, not `let`, precisely so rebuildStack() can swap in fresh objects.
+	private var session: MCSession
+	private var advertiser: MCNearbyServiceAdvertiser
+	private var browser: MCNearbyServiceBrowser
 	private let sessionID = UUID().uuidString
 
 	private let peerCountSubject = CurrentValueSubject<Int, Never>(0)
+	private let connectedPeerIDsSubject = CurrentValueSubject<[String], Never>([])
 	private let isRunningSubject = CurrentValueSubject<Bool, Never>(false)
 	private let peerConnectedSubject = PassthroughSubject<String, Never>()
 	private let messageReceivedSubject = PassthroughSubject<(data: Data, from: String), Never>()
 
 	var peerCountPublisher: AnyPublisher<Int, Never> { peerCountSubject.eraseToAnyPublisher() }
+	var connectedPeerIDsPublisher: AnyPublisher<[String], Never> { connectedPeerIDsSubject.eraseToAnyPublisher() }
 	var isRunningPublisher: AnyPublisher<Bool, Never> { isRunningSubject.eraseToAnyPublisher() }
 	var peerConnected: AnyPublisher<String, Never> { peerConnectedSubject.eraseToAnyPublisher() }
 	var messageReceived: AnyPublisher<(data: Data, from: String), Never> { messageReceivedSubject.eraseToAnyPublisher() }
@@ -49,9 +55,24 @@ final class MultipeerTransport: NSObject, MeshTransport {
 	private var hasStarted = false
 
 	init(displayName: String = UIDevice.current.name) {
-		let peerID = MCPeerID(displayName: displayName)
+		// Identity requirements, both of which must hold at once:
+		//  (1) unique per device — otherwise two devices sharing a `UIDevice.name` (common in
+		//      a test fleet of un-renamed "iPhone"s) collide into one identity, so the admin's
+		//      own member ID equals a connected peer's ID and that peer is filtered out of the
+		//      invite list (and membership silently breaks);
+		//  (2) shareable — the SAME string must be what remote peers see, since peers only ever
+		//      refer to each other by `stableID(for:)` == `MCPeerID.displayName` (which fills
+		//      `connectedPeerIDs`, `peerConnected`, and the `from` on received packets).
+		// The token is therefore baked into the MCPeerID displayName ITSELF (so Multipeer
+		// propagates it to peers), not appended only to the local `localPeerID` (which peers
+		// never see — that was the previous bug). `identifierForVendor` is stable per install,
+		// giving a persistent unique suffix. Result: local self-ID, peer-visible stableID, and
+		// connectedPeerIDs are all the same unique-and-shared string.
+		let token = UIDevice.current.identifierForVendor?.uuidString.prefix(8).description ?? "0000"
+		let uniqueName = "\(displayName)#\(token)"
+		let peerID = MCPeerID(displayName: uniqueName)
 		self.myPeerID = peerID
-		self.localPeerID = peerID.displayName + "-" + (UIDevice.current.identifierForVendor?.uuidString.prefix(8).description ?? "0000")
+		self.localPeerID = peerID.displayName
 		self.session = MCSession(peer: peerID, securityIdentity: nil, encryptionPreference: .required)
 		self.advertiser = MCNearbyServiceAdvertiser(peer: peerID, discoveryInfo: nil, serviceType: Self.serviceType)
 		self.browser = MCNearbyServiceBrowser(peer: peerID, serviceType: Self.serviceType)
@@ -77,6 +98,9 @@ final class MultipeerTransport: NSObject, MeshTransport {
 			return
 		}
 		hasStarted = true
+		// Fresh session/advertiser/browser every start. The old ones may have had disconnect()
+		// called on them (via stop()); Apple's stack does not reliably recover a used session.
+		rebuildStack()
 		if !isAdvertising {
 			advertiser.startAdvertisingPeer()
 			isAdvertising = true
@@ -110,10 +134,41 @@ final class MultipeerTransport: NSObject, MeshTransport {
 		cancelPendingInvites()
 		connectedPeerIDs.removeAll()
 		session.disconnect()
+		connectedPeerIDsSubject.send([])
 		isRunningSubject.send(false)
 		log("transport_stopped")
 		log("advertiser_state", fields: ["state": "stopped"])
 		log("browser_state", fields: ["state": "stopped"])
+	}
+
+	/// Tears down the current Multipeer stack and builds brand-new session/advertiser/browser
+	/// instances wired to this transport. Must run on the same (main) queue as start()/stop()
+	/// so `isAdvertising`/`isBrowsing` and the object swap stay consistent. Callers are
+	/// responsible for having stopped advertising/browsing on the old objects first (stop() does).
+	private func rebuildStack() {
+		// Detach delegates from the outgoing objects so any late callbacks from them are ignored.
+		advertiser.delegate = nil
+		browser.delegate = nil
+		session.delegate = nil
+		session.disconnect()
+
+		let freshSession = MCSession(peer: myPeerID, securityIdentity: nil, encryptionPreference: .required)
+		let freshAdvertiser = MCNearbyServiceAdvertiser(peer: myPeerID, discoveryInfo: nil, serviceType: Self.serviceType)
+		let freshBrowser = MCNearbyServiceBrowser(peer: myPeerID, serviceType: Self.serviceType)
+		freshSession.delegate = self
+		freshAdvertiser.delegate = self
+		freshBrowser.delegate = self
+		session = freshSession
+		advertiser = freshAdvertiser
+		browser = freshBrowser
+
+		// The old session is gone; its per-peer state is meaningless on the new one.
+		connectedPeerIDs.removeAll()
+		cancelPendingInvites()
+		sessionStateLock.lock()
+		sessionStates.removeAll()
+		sessionStateLock.unlock()
+		log("mc_session_rebuilt", sessionState: "notConnected")
 	}
 
 	/// Restarts advertising/browsing when the set of usable interfaces (Wi-Fi/Bluetooth
@@ -243,6 +298,7 @@ extension MultipeerTransport: MCSessionDelegate {
 				self.setSessionState(stateDescription, for: remoteID)
 			}
 			self.peerCountSubject.send(session.connectedPeers.count)
+			self.connectedPeerIDsSubject.send(session.connectedPeers.map(self.stableID(for:)))
 			if state == .connected {
 				self.inviteTimeoutWorkItems[remoteID]?.cancel()
 				self.inviteTimeoutWorkItems.removeValue(forKey: remoteID)
@@ -354,6 +410,7 @@ extension MultipeerTransport: MCNearbyServiceBrowserDelegate {
 			self.log("actor_hop_enter", remotePeerID: remoteID, fields: ["destination": "main", "source": "MCNearbyServiceBrowserDelegate.lostPeer"])
 			defer { self.log("actor_hop_exit", remotePeerID: remoteID, fields: ["destination": "main", "source": "MCNearbyServiceBrowserDelegate.lostPeer"]) }
 			self.peerCountSubject.send(self.session.connectedPeers.count)
+			self.connectedPeerIDsSubject.send(self.session.connectedPeers.map(self.stableID(for:)))
 		}
 	}
 

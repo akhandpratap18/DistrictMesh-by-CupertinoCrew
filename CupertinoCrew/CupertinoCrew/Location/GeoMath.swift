@@ -32,6 +32,19 @@ enum GeoMath {
 		return (deg + 360).truncatingRemainder(dividingBy: 360)
 	}
 
+	/// Whether a raw GPS sample is trustworthy enough to use and broadcast. Rejects three
+	/// bad-input classes that otherwise corrupt every bearing/distance downstream:
+	///   - invalid fixes (`horizontalAccuracy <= 0`, CoreLocation's "no fix" sentinel),
+	///   - too-coarse fixes (accuracy worse than `maxAccuracyMeters`),
+	///   - stale/cached fixes — iOS commonly delivers a cached location first, often from a
+	///     previous session and kilometres away; `ageSeconds` past `maxAgeSeconds` drops it.
+	/// This is the fix for "friend shows 5 km away / arrow stuck at a fixed wrong angle": a
+	/// cached coordinate is a fixed wrong point, so it skews distance and bearing together.
+	static func isAcceptableFix(horizontalAccuracy: Double, ageSeconds: Double,
+	                            maxAccuracyMeters: Double = 100, maxAgeSeconds: Double = 10) -> Bool {
+		horizontalAccuracy > 0 && horizontalAccuracy <= maxAccuracyMeters && ageSeconds <= maxAgeSeconds
+	}
+
 	/// Coarse, privacy-preserving distance label ("approx", never exact).
 	static func approxDistanceLabel(_ meters: Double) -> String {
 		switch meters {

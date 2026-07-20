@@ -184,3 +184,242 @@ The architecture remains one `MCSession`, one advertiser, one browser, a `MeshTr
 ### Recommended Phase 4 work
 
 Perform routing verification only: packet UUID deduplication, TTL/hop limits, relay exclusion, group/broadcast behavior, late joins, partitions, and rejoins. Keep the current architecture and diagnostics. Do not begin the production wallet phase until `GATE-WALLET-LEGAL` is open.
+
+## Engineering Handoff — Phase 5: Mesh Protocol Evolution & Reliability — 2026-07-19
+
+### Scope and result
+
+Protocol-layer work only. Transport (`MultipeerTransport`), routing (flood + dedup + TTL), memory-safety, and diagnostics from Phases 1–4 are preserved and continue to behave exactly as before. No feature logic (groups, discovery, wallet, navigation) was implemented — only the extensible protocol scaffolding those features will plug into. No UI was redesigned.
+
+**Architectural decision (compatibility):** the packet type was evolved *additively*, never rewritten. The struct was renamed `MeshMessage` → `MeshPacket` with `typealias MeshMessage = MeshPacket` so every existing call site compiles unchanged. All original stored properties keep their names, so the JSON wire format is a strict superset of the old one. New fields are `Optional`, so Swift's synthesized `Codable` encodes them via `encodeIfPresent` (omitted when nil) and decodes via `decodeIfPresent` (absent → nil). Consequences, verified by test:
+- New build → old build: extra keys are ignored by the old decoder; required keys all still present.
+- Old build → new build: missing new keys decode to nil.
+- The struct rename is invisible on the wire (JSON keys, not Swift type names, are what travels).
+
+### New protocol fields (`Mesh/MeshMessage.swift`)
+
+`MeshPacket` gained three optional, wire-compatible fields:
+- `previousHopPeerID: String?` — stable ID of the peer the packet was received from on the last hop; stamped by the relayer on each forward (nil on a freshly originated packet).
+- `destinationPeerID: String?` — optional unicast destination. nil = broadcast/flood to everyone (the only legacy behavior). When set and it equals the local peer, the bus treats the packet as delivered to its final destination and emits an ACK.
+- `groupID: String?` — carried but NOT interpreted yet; reserved for Phase 6 group scoping.
+
+Read-only vocabulary aliases were added so spec/feature code can use the requested names without changing the wire: `packetID` (→ `id`), `sourcePeerID` (→ `originPeerID`), `packetType` (→ `type`), `timestamp` (→ `createdAt`). Helpers: `isAddressed(to:)` (true only for a non-ACK packet whose destination is the local peer) and `relayed(previousHop:)`.
+
+### Packet type system
+
+`MeshMessageType` kept all Phase 1–4 cases with their frozen raw values and added: `text`, `heartbeat`, `ack`, `groupInvite`, `groupAccept`, `groupLeave`, `discovery`, `payment`, `paymentConfirmation`, `system`. Spec `UPPER_SNAKE` names map to these camelCase cases (mapping documented in-file). Only `.ack` has behavior wired this phase; the rest are inert scaffolding — the bus floods/dedups/expires them uniformly like any other type.
+
+### Hop count behavior
+
+- Increment happens in exactly one place: `MeshPacket.relayed(previousHop:)`, called once per relay in `MessageBus.handleIncoming`. Origin `send()` never increments.
+- Value semantics guarantee relaying produces a new copy and never mutates the received packet.
+- Exposed to upper layers via the public `MeshPacket.hopCount` (and every accepted packet is delivered through `MessageBus.inbox`).
+- In diagnostics: `stats.recordHopCount(_:)` folds each *inbound* packet's hop count (the value as received, before relay increment) into running average + maximum. In logging: `packet_received` and `packet_relay` events carry `hopCount`; relay also logs `previousHop`.
+- A relayed copy that reaches the hop/TTL budget (`isExpired`) is no longer broadcast — this trims a wasted send that old receivers would have dropped anyway (delivery reach is unchanged; it also bounds flood storms). Logged as `packet_dropped` / reason `hop_budget_exhausted`.
+
+### ACK architecture (`Mesh/MessageBus.swift`)
+
+Acknowledgement *infrastructure only — no automatic retries this phase.*
+- Outbound: `send()` on a directed, non-ACK packet (`destinationPeerID != nil`) registers a `PendingAck` and arms a timeout task (`ackTimeout = 30s`).
+- Delivery: when an inbound packet `isAddressed(to: localPeerID)`, the bus emits an `.ack` packet whose payload is an `AckPayload { acknowledgedPacketID }`, destined for the original source. ACKs flood back through the mesh (multi-hop) exactly like any packet; loops are bounded by the existing `seenIDs` dedup and `maxHops`.
+- Inbound ACK: only the true origin (`destinationPeerID == localPeerID`) consumes it — cancels the timeout, moves the id from pending → `acknowledgedPacketIDs`. Intermediate nodes just relay it.
+- Timeout: if the window elapses unacknowledged, the id moves to `timedOutPacketIDs`. No resend is attempted (deferred to a later phase).
+- State exposed read-only: `acknowledgedPacketIDs`, `timedOutPacketIDs`; pending count via `dashboard`.
+- Note: the diagnostics "Send test ping" packets carry no `destinationPeerID`, so they never trigger ACKs — the existing ping demo is unaffected.
+
+### Diagnostics additions (`Mesh/MeshStats.swift`, new)
+
+`MeshStats` (plain value type, mutated only on the `@MainActor` bus, all O(1)): `packetsSent`, `packetsReceived`, `packetsRelayed`, `packetsDelivered`, `packetsAcknowledged`, `packetsExpired`, `packetsDropped`, `duplicatePackets`, `averageHopCount`, `maximumHopCountSeen`, `lastActivity`. Published live as `MessageBus.stats`. New structured log events: `packet_delivered_to_destination`, `ack_pending`, `ack_sent`, `ack_received`, `ack_timeout`, `ack_decode_failed`. Existing event schema/behavior unchanged.
+
+### Debug dashboard support
+
+`MeshDashboardSnapshot` (in `MeshStats.swift`) + `MessageBus.dashboard` computed property expose: connected peers (list + count), relay count, average/maximum hop count, pending/acknowledged/timed-out ACK counts, full stats, and last activity. No UI consumes it yet (per scope). To feed the peer *list*, a read-only `connectedPeerIDsPublisher` was added to the `MeshTransport` protocol and `MultipeerTransport` (published on session change / peer loss / stop). This is pure observability — it touches no routing or send path.
+
+### Files modified
+
+- `Mesh/MeshMessage.swift` — `MeshMessage` → `MeshPacket` (+ typealias); optional addressing fields; vocabulary aliases; expanded `MeshMessageType`; `AckPayload`; `relayed(previousHop:)`; `ackTTL`; `isAddressed(to:)`.
+- `Mesh/MeshStats.swift` — **new**: `MeshStats`, `MeshDashboardSnapshot`.
+- `Mesh/MessageBus.swift` — `@Published stats`, `@Published connectedPeerIDs`; ACK tracking state + `registerPendingAck`/`sendAck`/`processIncomingAck`/`ackTimedOut`; hop/stat accounting in `handleIncoming`/`accept`/`broadcast`/`send`; `dashboard`; deinit cancels pending-ACK timeout tasks.
+- `Mesh/MeshTransport.swift` — added `connectedPeerIDsPublisher` requirement.
+- `Mesh/MultipeerTransport.swift` — implemented `connectedPeerIDsPublisher` (additive, read-only).
+- `Tests/MeshPacketProtocolTests.swift` — **new**, outside the Xcode synchronized group (not compiled into the app; the project has no XCTest target).
+
+### Testing completed
+
+- Generic iOS build: `** BUILD SUCCEEDED **`. Phase 5 code introduced zero new warnings. Four pre-existing `MultipeerTransport` warnings (defer-at-scope-end in resource delegates, dead branch of the auto-accept `true ? :` ternary) and the unrelated AppIntents-metadata warning remain untouched.
+- Executable protocol harness (compiles the real Foundation-only model sources): `swiftc Mesh/MeshMessage.swift Mesh/MeshStats.swift Tests/MeshPacketProtocolTests.swift && ./out` → **40/40 assertions PASS**. Covers round-trip serialize/deserialize, backward-compat decode of a legacy byte set, forward-compat (nil optionals omitted), hop-increment-exactly-once, TTL/hop-budget expiry, ACK payload + addressing, packet-type round-trips, stats aggregation.
+- Not run: physical multi-device over-the-air test (no devices in this environment) — carried forward as the standing verification gap from Phases 1–4.
+
+### Remaining TODOs / risks
+
+- Physical 2- and 3-device verification of relay + the new ACK round trip is still outstanding (consistent with unresolved P1/P2 statuses).
+- ACK matching keys on `destinationPeerID == transport.localPeerID`. Feature layers that originate directed packets must set `destinationPeerID`/`originPeerID` using the transport's stable-ID scheme (`name-<vendorPrefix>`), not the raw `UIDevice.name` the ping demo uses, or ACKs won't match.
+- No XCTest target exists; protocol tests are executed via the standalone `swiftc` harness. Wiring a real test target (manual `.pbxproj` surgery on the Xcode-16 synchronized-folder project) was deliberately deferred to avoid destabilizing the build.
+- Persistence/encode failures remain best-effort (now counted in `packetsDropped`), still not surfaced to the user.
+
+### Recommended Phase 6 work
+
+Groups — but wait for explicit approval before starting (per the Phase 5 directive). When approved: interpret `groupID` for scoped delivery, add group membership state, and build `groupInvite`/`groupAccept`/`groupLeave` handling on top of this scaffolding. Also candidates: ACK-driven retransmission policy (the deferred half of reliability), and a developer dashboard view backed by `MessageBus.dashboard`. Do not begin production wallet work until `GATE-WALLET-LEGAL` is open.
+
+## Engineering Handoff — Phase 6: Group Management — 2026-07-19
+
+### Scope and result
+
+Application layer on top of the mesh. Transport, the Phase 5 mesh protocol (flood + dedup + TTL + hop counting), the ACK infrastructure, diagnostics, and memory-safety are all preserved and behave exactly as before. Phase 6 adds group membership as a **new layer that rides on the existing bus** — it never touches routing.
+
+**Key architectural property (relay independence):** the bus relays every accepted packet in `MessageBus.handleIncoming` *before and independent of* any group logic, so multi-hop relay is unchanged and works regardless of group membership — exactly as required. `GroupManager` consumes the post-relay `inbox` fan-out and only mutates local state; **non-members relay a group packet (via the bus) and then ignore its payload** (the handler returns early when the packet is not relevant to a group they belong to / an invite addressed to them). Verified by test: a third node relays all group traffic but stores zero group state.
+
+**Decoupling decision:** `GroupManager` depends on a narrow `@MainActor protocol GroupPacketChannel` (`localPeerID`, `groupInbox`, `send`) that `MessageBus` conforms to — not on the concrete bus/transport. This keeps the group layer away from routing entirely and makes it unit-testable against a fake mesh with no MultipeerConnectivity.
+
+### New files
+
+- `Mesh/MeshGroup.swift` — `MeshGroup` replica (`id`, `name`, `adminPeerID`, `members: Set<String>`, `createdAt`) + all seven Codable control payloads + the received-`GroupInvite` view model. `members` is a Set, so **duplicate members are structurally impossible**.
+- `Mesh/GroupManager.swift` — `GroupPacketChannel` protocol + `@MainActor final class GroupManager: ObservableObject`.
+
+### Files modified
+
+- `Mesh/MeshMessage.swift` — added packet types `groupDecline`, `groupDelete`, `groupRemove`, `groupSync` (the existing `groupInvite`/`groupAccept`/`groupLeave` are reused). Additive; wire-compatible.
+- `Mesh/MessageBus.swift` — declared `GroupPacketChannel` conformance and exposed `localPeerID` + `groupInbox` (a read-only alias of the existing post-relay `inbox`). No routing/send changes.
+- `CupertinoCrewApp.swift` — construct one shared `MessageBus` and a `GroupManager(channel: bus)`, inject both as environment objects. No second transport. ContentView/UI unchanged (no group UI this phase — protocol/logic only).
+- `Tests/GroupManagerTests.swift` — **new**, outside the synchronized group.
+
+### Operations (all on GroupManager, all return false on an invalid op)
+
+- `createGroup(name:)` — local only, admin = this device, no packet emitted until first invite.
+- `inviteMember(_:to:)` — any member may invite. Rejects **self-invite**, **duplicate member**, **duplicate pending invite**, and non-member/unknown-group callers. Emits `groupInvite`.
+- `acceptInvite(_:)` / `joinGroup(_:)` (alias) — requires a pending invite; builds/updates the local replica and emits `groupAccept`. Join == accept in this model.
+- `declineInvite(_:)` — emits `groupDecline`.
+- `leaveGroup(_:)` — member drops its replica, emits `groupLeave`.
+- `deleteGroup(_:)` — **admin only**; emits `groupDelete`.
+- `removeMember(_:from:)` — **admin only**, cannot target self, member must exist; emits `groupRemove` then a `groupSync`.
+- `synchronizeGroup(_:)` — any member broadcasts the full roster snapshot.
+
+### Membership synchronization
+
+Eventually-consistent, admin-authoritative. Each member keeps a `MeshGroup` replica. `groupAccept`/`groupLeave` mutate rosters incrementally; the admin re-broadcasts a `groupSync` (full snapshot) after roster changes so all members converge. Inbound `groupSync`/`groupDelete`/`groupRemove` are honored **only when the packet's stated admin matches the replica's known `adminPeerID`** — a non-admin cannot dissolve a group or evict members. An evicted peer (or one excluded from an authoritative sync) drops its own replica.
+
+### Packet flow (unchanged transport)
+
+Group control packets are ordinary broadcasts: `MeshPacket(type: .group*, groupID: <uuid>, payload: <Codable>)`, `originPeerID = localPeerID`, TTL 300s. They flood + store-and-forward + dedup exactly like any packet (so late joiners can still receive them within the TTL window). They carry no unicast `destinationPeerID`, so they deliberately do **not** engage the Phase 5 ACK path — accept/decline are the application-level acknowledgement of an invite. The Phase 5 ACK infrastructure is untouched and still applies to directed non-group packets.
+
+### Testing completed
+
+- Generic iOS build: `** BUILD SUCCEEDED **`, **zero new warnings** (only the unrelated AppIntents-metadata note and the four pre-existing `MultipeerTransport` warnings remain).
+- `Tests/GroupManagerTests.swift` (real `GroupManager` over a fake flood mesh, no transport): **44/44 assertions PASS** — create/invite/accept, non-member ignore, all guard rails (self/duplicate/non-admin/invalid), decline, 3-member sync convergence, admin remove (+ evicted self-drop + peer convergence), leave, admin delete.
+- Phase 5 regression: `Tests/MeshPacketProtocolTests.swift` still **40/40 PASS** (ACK, hop-once, TTL, backward/forward compat, stats) — confirms the mesh protocol and ACK infra are unchanged.
+- Not run: physical multi-device over-the-air test (no devices here) — standing gap carried from earlier phases.
+
+### Remaining TODOs / risks
+
+- **Trust:** admin authority is enforced by matching `adminPeerID` strings only. The transport is untrusted by design (SRD); a malicious peer could forge a `groupDelete`/`groupRemove` with a spoofed admin ID. Real signing of group control packets is deferred — required before any production use.
+- **Admin departure:** an admin may `leaveGroup` (leaving members with a stale admin field) rather than being forced to `deleteGroup`. No admin succession is implemented. Decide the policy in a later phase.
+- **Replica bootstrap:** on accept, a joiner's replica starts as `{admin, self}` until the admin's `groupSync` arrives; during a partition it may be briefly incomplete (converges on reconnect via store-and-forward). Acceptable for the eventually-consistent model; document for UI.
+- No XCTest target still (protocol/group tests run via the standalone `swiftc` harness); no group UI (logic-only phase).
+- `pendingInvitees` is per-device bookkeeping for dup-invite suppression and is not synced; two members inviting the same peer simultaneously can both emit an invite (harmless — the invitee dedups, and a second accept is a Set no-op).
+
+### Recommended Phase 7 work
+
+Group-scoped messaging UI + `groupID`-filtered display on top of this membership layer; sign group control packets (close the trust TODO); ACK-driven retransmission (the deferred half of Phase 5 reliability). Do not begin production wallet work until `GATE-WALLET-LEGAL` is open.
+
+## Engineering Handoff — Developer Group Testing UI — 2026-07-19
+
+### Scope and result
+
+UI-only. A developer testing screen for the existing Phase 6 `GroupManager` was added. No transport, routing, ACK, or mesh-protocol code was modified — nothing under `Mesh/` changed except that the UI reads its published state. The screen contains **no business logic**: every action calls an existing `GroupManager` / `MessageBus` API and every value is bound to existing published state. Not a shipping/user-facing screen.
+
+### Files
+
+- `GroupTestingView.swift` — **new**. `GroupTestingView` (identity, connected peers, pending invites, create, group list) + `GroupDetailView` (member roster, invite connected peer, leave, admin delete/remove). Both take `MessageBus` and `GroupManager` as `@EnvironmentObject` (already injected at the app root in Phase 6).
+- `ContentView.swift` — added a single `Section("Developer")` with a `NavigationLink` to `GroupTestingView`. The existing diagnostics screen is otherwise unchanged (no redesign).
+
+### What it exposes / does
+
+- Displays: **Local Peer ID** (`groups.localPeerID`), **Connected Peers** (`bus.connectedPeerIDs` + `bus.peerCount`), **My Groups** with admin badge, **Current Group** (the `GroupDetailView` you drill into, looked up live so it reflects membership changes and empties on delete/eviction), **Pending Invitations** (`groups.receivedInvites`).
+- Actions (all call existing APIs): Create (`createGroup`), Invite a connected peer (`inviteMember`), Accept/Decline (`acceptInvite`/`declineInvite`), Leave (`leaveGroup`), Delete — admin (`deleteGroup`), Remove Member — admin (`removeMember`). Admin-only buttons render only when `group.isAdmin(localPeerID)`.
+- Each guarded op's Bool result is surfaced in a "Last action" row (`ok` / `rejected`) so a tester can see when a guard (self-invite, duplicate, non-admin, etc.) fires.
+
+### Known limitation surfaced (NOT fixed — backend, out of this phase's scope)
+
+The transport's identity scheme is inconsistent: a device's own `transport.localPeerID` is `displayName + "-" + vendorPrefix`, but peers are listed to each other via `connectedPeerIDs` = `displayName` only (no suffix). So "Invite connected peer" sends an invite keyed by the bare display name, which will **not** match that invitee's own `localPeerID` — cross-device membership convergence can therefore fail even though every UI action executes and every guard behaves correctly. This is a pre-existing backend ID-scheme issue (already flagged in the Phase 5 handoff's addressing TODO), not a UI defect. Fixing it means unifying the transport's self-ID and peer-ID representation — a transport change, explicitly out of scope here. Recommended as the first item of the next backend phase.
+
+### Testing performed
+
+- Generic iOS build: `** BUILD SUCCEEDED **`, **zero new warnings** (only the unrelated AppIntents note + the four pre-existing `MultipeerTransport` warnings remain).
+- Backend regression (the APIs the UI drives): `GroupManagerTests` **44/44 PASS**, `MeshPacketProtocolTests` **40/40 PASS** — mesh protocol, ACK infra, and group logic all unchanged.
+- Not performed: driving the SwiftUI screen over the air. This project is real-device-only (no simulator, per the Decisions Log) and no physical devices are available in this environment, so the UI could not be exercised live. The screen binds exclusively to already-tested APIs; on-device click-through of the group flows remains an outstanding manual verification step (same standing device-test gap as prior phases).
+
+### Remaining TODOs
+
+- Manual on-device walkthrough of the testing UI across 2–3 phones.
+- Unify the transport peer-ID scheme (see limitation above) before group membership can converge across real devices.
+- All prior-phase TODOs still stand (group control-packet signing, admin succession, no XCTest target, no user-facing group UI).
+
+## Engineering Handoff — Bugfix: Group Invitation Lifecycle (identity mismatch) — 2026-07-19
+
+### Symptom
+
+A creates a group and invites B. B receives the GROUP_INVITE packet (visible in the Received section) but it never appears in Pending Invitations and B gets no Accept/Decline option.
+
+### Root cause
+
+The transport used two *different* identity representations for the same device:
+- `MultipeerTransport.localPeerID` was `MCPeerID.displayName + "-" + <vendorPrefix>` (e.g. `"Bob-e5f6g7h8"`). This is the value `MessageBus.localPeerID` → `GroupManager.localPeerID` exposes, i.e. how a device identifies *itself* (group admin/member ID, invite-target check).
+- Every place a device is referred to by *others* uses `stableID(for:) == MCPeerID.displayName` (e.g. `"Bob"`): `connectedPeerIDs`, `peerConnected`, and the `from` on received packets.
+
+The vendor suffix is device-local (`identifierForVendor`) and can never be reproduced by a remote peer, so a device's self-ID never equaled the ID others addressed it by. Concretely: the testing UI invites the peer shown in `connectedPeerIDs` (`"Bob"`), so the packet's `invitedPeerID == "Bob"`; on B, `GroupManager.handleInvite` runs `guard p.invitedPeerID == localPeerID` → `"Bob" == "Bob-e5f6g7h8"` → false → early return. The invite is silently dropped; `receivedInvites` never mutates; SwiftUI has nothing to show. Transport/decoding/subscription/@MainActor/@Published were all fine — the lifecycle died at the identity comparison.
+
+This was masked by the Phase 6 unit tests, which used self-consistent IDs (`"A"`/`"B"`/`"C"`) and therefore never exercised the mismatch. `MessageBus.localPeerID` (line 56) was the sole consumer of the suffix.
+
+The reported "Device A marks the invitation Rejected": no such path exists in this codebase — `GroupManager.emit` sets no `destinationPeerID`, so group invites never register a pending ACK, so there is no ACK timeout and no auto-reject. Sender state changes only on an explicit inbound `groupAccept`/`groupDecline`. Requirement "sender must never mark accepted/rejected without an explicit packet" was already satisfied and remains so.
+
+### Fix implemented
+
+`Mesh/MultipeerTransport.swift` — `localPeerID` is now `peerID.displayName` (the vendor suffix removed), making the local self-ID identical to the peer-visible `stableID`. One line of behavior; no change to routing, relay, dedup, ACK, or the mesh protocol — those already keyed on `displayName` (`stableID`) everywhere. If anything this also makes the Phase 5 ACK `destinationPeerID == localPeerID` match correct for directed packets. After the fix: A invites `"Bob"`, B's `localPeerID == "Bob"`, the guard passes, the invite is stored, `@Published receivedInvites` updates, SwiftUI shows it, Accept/Decline emit `groupAccept`/`groupDecline`, and A converges — the full lifecycle.
+
+### Files modified
+
+- `Mesh/MultipeerTransport.swift` — `localPeerID` set to bare `displayName` (+ explanatory comment). No UI was patched (per instruction).
+- `Tests/GroupManagerTests.swift` — added a root-cause regression: an invite addressed to an ID that is not the invitee's `localPeerID` is NOT stored (bug repro), and a correctly-addressed invite IS stored. Locks the identity invariant.
+
+### Verification performed
+
+- Generic iOS build: `** BUILD SUCCEEDED **`, no new warnings (only the unrelated AppIntents note + four pre-existing `MultipeerTransport` warnings).
+- `GroupManagerTests`: **48/48 PASS** (44 prior + 4 new regression assertions), including "mismatched-ID invite is NOT stored" and "correctly-addressed invite IS stored".
+- `MeshPacketProtocolTests`: **40/40 PASS** — mesh protocol, ACK, hop, TTL, backward/forward compat unchanged by the identity fix.
+- Not performed: two-physical-device confirmation (invite appears immediately, accept/decline, no auto-reject, membership sync). No devices are available in this environment (real-device-only project). The fix is proven at the logic level (guard now matches) and by the regression test; on-device confirmation across 2 phones remains the one outstanding manual step.
+
+### Remaining TODOs
+
+- On-device 2-phone confirmation of the invite → accept/decline → membership-sync flow.
+- Duplicate `displayName`s across devices now collide on identity (Multipeer names are `UIDevice.name`); acceptable for the current test fleet (distinct names), but a durable unique-yet-shareable peer ID (exchanged via discovery info, not a local-only suffix) is the proper long-term fix.
+- All prior-phase TODOs still stand (group control-packet signing, admin succession, no XCTest target).
+
+## Engineering Handoff — Bugfix: connected peer missing from "Invite Connected Peer" — 2026-07-19
+
+### Symptom
+
+A peer is connected (shows in the peer count) but does not appear in a group's "Invite Connected Peer" list, so it cannot be invited.
+
+### Root cause
+
+Duplicate-identity collision introduced by the previous fix. `peerCount` and `connectedPeerIDs` are both published from `session.connectedPeers` in the same block (`MultipeerTransport` didChange, lines ~255–256), so the list is never empty while the count is positive — the peer *is* in `connectedPeerIDs`. The invite list filters `bus.connectedPeerIDs.filter { !group.contains($0) }`. The prior fix set identity to the **bare `UIDevice.name`**, so two devices sharing a name (e.g. several un-renamed "iPhone"s) resolve to the *same* identity string. The group admin's own member ID then equals the connected peer's ID, `group.contains(peer)` is true, and the peer is filtered out as "self." (Membership would also silently misbehave.)
+
+### Fix implemented
+
+`Mesh/MultipeerTransport.swift` — the uniqueness token (`identifierForVendor` prefix, stable per install) is now baked into the **`MCPeerID.displayName` itself** (`"\(UIDevice.name)#\(token)"`), not appended only to `localPeerID`. Because the displayName is what Multipeer propagates to peers, `stableID(for:)` (== remote `displayName`), `connectedPeerIDs`, and each device's own `localPeerID` are now the **same unique-and-shared** string. This satisfies both requirements simultaneously: unique per device (no collision → connected non-member peers show and can be invited) and shareable (the invite's `invitedPeerID` still equals the invitee's `localPeerID`, so the Phase-6 invite lifecycle fix from the previous handoff keeps working). This supersedes the previous handoff's bare-displayName choice and closes the "durable unique-yet-shareable peer ID" TODO.
+
+### Files modified
+
+- `Mesh/MultipeerTransport.swift` — `MCPeerID` constructed with `"<name>#<vendorToken>"`; `localPeerID` = that displayName. No routing/ACK/mesh-protocol logic changed. No UI patched.
+
+### Verification performed
+
+- Generic iOS build: `** BUILD SUCCEEDED **`, no new warnings (only the standing pre-existing ones).
+- `GroupManagerTests` **48/48** and `MeshPacketProtocolTests` **40/40** remain green (transport identity is not exercised by the harnesses; group/protocol logic unchanged).
+- Not performed: 2-physical-device confirmation that the connected peer now appears in the invite list and an invite round-trips (no devices in this environment). Proven at the logic level: distinct devices now yield distinct IDs, so the `!group.contains($0)` filter no longer hides a real peer, while self-ID == peer-visible ID keeps the invite check matching.
+
+### Remaining TODOs
+
+- On-device 2-phone confirmation (peer shows in invite list → invite → accept/decline → membership sync).
+- A truly persistent identity across app reinstalls would need a stored token rather than `identifierForVendor` (which resets on reinstall); acceptable for now.
+- All prior-phase TODOs still stand.

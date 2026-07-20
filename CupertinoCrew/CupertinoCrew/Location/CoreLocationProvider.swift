@@ -31,6 +31,12 @@ final class CoreLocationProvider: NSObject, DeviceLocationProvider, CLLocationMa
 
 	nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
 		guard let loc = locations.last else { return }
+		
+		let ageSeconds = -loc.timestamp.timeIntervalSinceNow
+		guard GeoMath.isAcceptableFix(horizontalAccuracy: loc.horizontalAccuracy, ageSeconds: ageSeconds) else {
+			return
+		}
+
 		let coord = GeoCoordinate(latitude: loc.coordinate.latitude, longitude: loc.coordinate.longitude)
 		Task { @MainActor in
 			self.currentCoordinate = coord

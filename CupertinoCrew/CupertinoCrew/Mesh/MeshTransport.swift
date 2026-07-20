@@ -10,6 +10,10 @@ protocol MeshTransport: AnyObject {
 	/// Number of currently connected peers, live.
 	var peerCountPublisher: AnyPublisher<Int, Never> { get }
 
+	/// Stable IDs of the currently connected peers, live. Read-only observability for
+	/// the Phase 5 dashboard data — it does not affect routing or send behavior.
+	var connectedPeerIDsPublisher: AnyPublisher<[String], Never> { get }
+
 	/// True once advertising+browsing are running (does not imply any peers connected).
 	var isRunningPublisher: AnyPublisher<Bool, Never> { get }
 

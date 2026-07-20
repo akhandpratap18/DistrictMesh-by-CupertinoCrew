@@ -37,6 +37,12 @@ struct Runner {
 		check(GeoMath.approxDistanceLabel(1200) == "~1 km", "label 1200m")
 		check(GeoMath.approxDistanceLabel(5000) == "~5 km", "label 5000m")
 
+		// GPS-fix acceptance: good fresh fix accepted; invalid/coarse/stale rejected.
+		check(GeoMath.isAcceptableFix(horizontalAccuracy: 5, ageSeconds: 1) == true, "good fresh fix accepted")
+		check(GeoMath.isAcceptableFix(horizontalAccuracy: -1, ageSeconds: 1) == false, "invalid (negative accuracy) rejected")
+		check(GeoMath.isAcceptableFix(horizontalAccuracy: 500, ageSeconds: 1) == false, "too-coarse fix rejected")
+		check(GeoMath.isAcceptableFix(horizontalAccuracy: 5, ageSeconds: 120) == false, "stale/cached fix rejected")
+
 		print(failures == 0 ? "\nALL PASSED" : "\n\(failures) FAILED")
 		exit(failures == 0 ? 0 : 1)
 	}
